@@ -1619,11 +1619,12 @@ install_nixos() {
 
     os_dir=/os
     keep_swap=true
+    nixos_swap_size=1024
+    nixos_swapfile=/.swap/real-path
     nix_from=website
     ram_per_thread=2048
 
     threads=$(get_build_threads $ram_per_thread)
-    swap_size=$(get_need_swap_size $ram_per_thread)
 
     show_nixos_config() {
         echo
@@ -1635,10 +1636,8 @@ install_nixos() {
     }
 
     # 挂载分区，创建 swapfile
-    mount_part_basic_layout /os /os/efi
-    if [ "$swap_size" -gt 0 ]; then
-        create_swap "$swap_size" /os/swapfile
-    fi
+    mount_nixos_btrfs_layout /os
+    create_swap "$nixos_swap_size" "/os$nixos_swapfile"
 
     # 步骤
     # 1. 安装 nix (nix-xxx)
@@ -1760,8 +1759,8 @@ install_nixos() {
         nix_substituters="nix.settings.substituters = lib.mkForce [ \"$mirror/store\" ];"
     fi
 
-    if [ -e /os/swapfile ] && $keep_swap; then
-        nix_swap="swapDevices = [{ device = \"/swapfile\"; size = $swap_size; }];"
+    if [ -e "/os$nixos_swapfile" ] && $keep_swap; then
+        nix_swap="swapDevices = [{ device = \"$nixos_swapfile\"; size = $nixos_swap_size; }];"
     fi
 
     if is_need_set_ssh_keys; then
@@ -1895,12 +1894,12 @@ EOF
     apk del nix
 
     # swapfile
-    if [ -e /os/swapfile ]; then
+    if [ -e "/os$nixos_swapfile" ]; then
         if $keep_swap; then
             :
         else
             swapoff -a
-            rm -rf /os/swapfile
+            rm -rf "/os$nixos_swapfile"
         fi
     fi
 
@@ -2753,8 +2752,21 @@ create_part() {
             mkfs.ext4 -F -L os "/dev/$(xda 1)"        #1 os
             mkfs.ext4 -F -L installer "/dev/$(xda 2)" #2 installer
         fi
+    elif [ "$distro" = nixos ]; then
+        apk add btrfs-progs
+
+        parted /dev/$xda -s -- \
+            mklabel gpt \
+            mkpart disk-main-boot ext4 1MiB 2MiB \
+            mkpart disk-main-nixos btrfs 2MiB 100% \
+            set 1 bios_grub on
+        update_part
+
+        echo                                #1 bios_boot
+        mkfs.btrfs -f -L nixos "/dev/$(xda 2)" #2 nixos
+        create_nixos_btrfs_subvolumes
     elif [ "$distro" = alpine ] || [ "$distro" = arch ] || [ "$distro" = gentoo ] ||
-        [ "$distro" = nixos ] || [ "$distro" = aosc ]; then
+        [ "$distro" = aosc ]; then
         # alpine 本身关闭了 64bit ext4
         # https://gitlab.alpinelinux.org/alpine/alpine-conf/-/blob/3.18.1/setup-disk.in?ref_type=tags#L908
         # 而且 alpine 的 extlinux 不兼容 64bit ext4
@@ -5521,6 +5533,40 @@ resize_after_install_cloud_image() {
         update_part
         parted /dev/$xda -s print
     fi
+}
+
+nixos_btrfs_mount_opts() {
+    echo "noatime,compress-force=zstd:-5,space_cache=v2"
+}
+
+create_nixos_btrfs_subvolumes() {
+    local mnt=/mnt/nixos-btrfs
+
+    mkdir -p $mnt
+    mount -t btrfs "/dev/$(xda 2)" $mnt
+    for subvol in @root @boot @nix @swap @persist; do
+        btrfs subvolume create "$mnt/$subvol"
+    done
+    umount $mnt
+    rmdir $mnt
+}
+
+mount_nixos_btrfs_layout() {
+    local os_dir=$1
+    local part="/dev/$(xda 2)"
+    local mount_opts
+
+    mount_opts=$(nixos_btrfs_mount_opts)
+
+    mkdir -p $os_dir
+    mount -t btrfs -o "subvol=@root,$mount_opts" "$part" $os_dir
+
+    mkdir -p $os_dir/boot $os_dir/nix $os_dir/.swap $os_dir/persist $os_dir/.subvols
+    mount -t btrfs -o "subvol=@boot,$mount_opts" "$part" $os_dir/boot
+    mount -t btrfs -o "subvol=@nix,$mount_opts" "$part" $os_dir/nix
+    mount -t btrfs -o "subvol=@swap" "$part" $os_dir/.swap
+    mount -t btrfs -o "subvol=@persist,$mount_opts" "$part" $os_dir/persist
+    mount -t btrfs -o "subvolid=5" "$part" $os_dir/.subvols
 }
 
 mount_part_basic_layout() {
