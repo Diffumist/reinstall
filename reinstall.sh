@@ -2188,9 +2188,9 @@ is_valid_ram_size() {
 check_ram() {
     ram_standard=$(
         case "$distro" in
-        netboot.xyz) echo 0 ;;
+        netboot.xyz | nixos) echo 0 ;;
         alpine | debian | kali | dd) echo 256 ;;
-        arch | gentoo | aosc | nixos | windows) echo 512 ;;
+        arch | gentoo | aosc | windows) echo 512 ;;
         redhat | centos | almalinux | rocky | fedora | oracle | ubuntu | anolis | opencloudos | openeuler) echo 1024 ;;
         opensuse | fnos) echo -1 ;; # 没有安装模式
         esac

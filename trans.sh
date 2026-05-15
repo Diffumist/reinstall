@@ -1259,55 +1259,9 @@ create_nixos_network_config() {
     # 头部
     cat <<EOF >>$conf_file
 networking = {
-  usePredictableInterfaceNames = false;
+  useNetworkd = true;
+  useDHCP = false;
 EOF
-
-    for ethx in $(get_eths); do
-        # ipv4 使用 DHCP 时显式开启 useDHCP
-        if is_dhcpv4; then
-            cat <<EOF >>$conf_file
-  interfaces.$ethx.useDHCP = true;
-EOF
-        fi
-
-        # ipv4
-        if is_staticv4; then
-            get_netconf_to ipv4_addr
-            get_netconf_to ipv4_gateway
-            IFS=/ read -r address prefix < <(echo "$ipv4_addr")
-            cat <<EOF >>$conf_file
-  interfaces.$ethx.ipv4.addresses = [
-    {
-      address = "$address";
-      prefixLength = $prefix;
-    }
-  ];
-  defaultGateway = {
-    address = "$ipv4_gateway";
-    interface = "$ethx";
-  };
-EOF
-        fi
-
-        # ipv6
-        if is_staticv6; then
-            get_netconf_to ipv6_addr
-            get_netconf_to ipv6_gateway
-            IFS=/ read -r address prefix < <(echo "$ipv6_addr")
-            cat <<EOF >>$conf_file
-  interfaces.$ethx.ipv6.addresses = [
-    {
-      address = "$address";
-      prefixLength = $prefix;
-    }
-  ];
-  defaultGateway6 = {
-    address = "$ipv6_gateway";
-    interface = "$ethx";
-  };
-EOF
-        fi
-    done
 
     # 全局 dns
     need_set_dns=false
@@ -1329,67 +1283,130 @@ EOF
     # 尾部
     cat <<EOF >>$conf_file
 };
+services.resolved.enable = true;
 EOF
 
-    # nixos 默认网络管理器是 dhcpcd
-    # 但配置静态 ip 时用的是脚本
-    # /nix/store/qcr1xxjdxcrnwqwrgysqpxx2aibp9fdl-unit-script-network-addresses-eth0-start/bin/network-addresses-eth0-start
-    # ...
-    # if out=$(ip addr replace "181.x.x.x/24" dev "eth0" 2>&1); then
-    #   echo "done"
-    # else
-    #   echo "'ip addr replace "181.x.x.x/24" dev "eth0"' failed: $out"
-    #   exit 1
-    # fi
-    # ...
-
-    # 禁用 ra/autoconf
-    local mode=1
     for ethx in $(get_eths); do
-        if should_disable_accept_ra; then
-            case "$mode" in
-            1)
-                cat <<EOF >>$conf_file
-boot.kernel.sysctl."net.ipv6.conf.$ethx.accept_ra" = false;
+        get_netconf_to mac_addr
+
+        cat <<EOF >>$conf_file
+systemd.network.networks."10-$ethx" = {
+  matchConfig.MACAddress = "$mac_addr";
 EOF
-                ;;
-            2)
-                # nixos 配置静态 ip 时用的是脚本
-                # 好像因此不起作用
-                cat <<EOF >>$conf_file
-networking.dhcpcd.extraConfig =
-  ''
-    interface $ethx
-      ipv6ra_noautoconf
-  '';
-EOF
-                ;;
-            3)
-                # 暂时没用到 networkd
-                cat <<EOF >>$conf_file
-systemd.network.networks.$ethx = {
-   matchConfig.Name = "$ethx";
-   networkConfig = {
-     IPv6AcceptRA = false;
-   };
- };
-EOF
-                ;;
-            esac
+
+        dhcp=
+        if is_dhcpv4; then
+            dhcp=ipv4
+        fi
+        if is_dhcpv6; then
+            if [ -n "$dhcp" ]; then
+                dhcp=yes
+            else
+                dhcp=ipv6
+            fi
         fi
 
-        if should_disable_autoconf; then
-            case "$mode" in
-            1)
-                cat <<EOF >>$conf_file
-boot.kernel.sysctl."net.ipv6.conf.$ethx.autoconf" = false;
-EOF
-                ;;
-            2) ;;
-            3) ;;
-            esac
+        accept_ra=
+        if should_disable_accept_ra; then
+            accept_ra=false
+        elif is_slaac || is_dhcpv6; then
+            accept_ra=true
         fi
+
+        if [ -n "$dhcp" ] || [ -n "$accept_ra" ]; then
+            cat <<EOF >>$conf_file
+  networkConfig = {
+EOF
+            if [ -n "$dhcp" ]; then
+                cat <<EOF >>$conf_file
+    DHCP = "$dhcp";
+EOF
+            fi
+            if [ -n "$accept_ra" ]; then
+                cat <<EOF >>$conf_file
+    IPv6AcceptRA = $accept_ra;
+EOF
+            fi
+            cat <<EOF >>$conf_file
+  };
+EOF
+        fi
+
+        # 静态地址
+        if is_staticv4 || is_staticv6; then
+            cat <<EOF >>$conf_file
+  address = [
+EOF
+        fi
+        if is_staticv4; then
+            get_netconf_to ipv4_addr
+            cat <<EOF >>$conf_file
+    "$ipv4_addr"
+EOF
+        fi
+        if is_staticv6; then
+            get_netconf_to ipv6_addr
+            cat <<EOF >>$conf_file
+    "$ipv6_addr"
+EOF
+            get_netconf_to ipv6_extra_addrs
+            if [ -n "$ipv6_extra_addrs" ]; then
+                (
+                    IFS=','
+                    for _addr in $ipv6_extra_addrs; do
+                        echo "    \"$_addr\"" >>$conf_file
+                    done
+                )
+            fi
+        fi
+        if is_staticv4 || is_staticv6; then
+            cat <<EOF >>$conf_file
+  ];
+EOF
+        fi
+
+        # 静态默认路由。GatewayOnLink 可兼容网关不在本机地址前缀内的云环境。
+        if is_staticv4 || is_staticv6; then
+            cat <<EOF >>$conf_file
+  routes = [
+EOF
+        fi
+        if is_staticv4; then
+            get_netconf_to ipv4_gateway
+            cat <<EOF >>$conf_file
+    {
+      Gateway = "$ipv4_gateway";
+      GatewayOnLink = true;
+    }
+EOF
+        fi
+        if is_staticv6; then
+            get_netconf_to ipv6_gateway
+            cat <<EOF >>$conf_file
+    {
+      Gateway = "$ipv6_gateway";
+      GatewayOnLink = true;
+    }
+EOF
+        fi
+        if is_staticv4 || is_staticv6; then
+            cat <<EOF >>$conf_file
+  ];
+EOF
+        fi
+
+        if should_disable_autoconf && ! should_disable_accept_ra; then
+            cat <<EOF >>$conf_file
+  ipv6AcceptRAConfig.UseAutonomousPrefix = false;
+EOF
+        fi
+
+        cat <<EOF >>$conf_file
+};
+EOF
     done
+
+    # nixos 默认网络后端是 dhcpcd/脚本，这里改成由 systemd-networkd 接管，并按 MAC 匹配网卡
 }
 
 install_alpine() {
