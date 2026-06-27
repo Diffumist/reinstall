@@ -1766,9 +1766,7 @@ install_nixos() {
     show_nixos_config
 
     # 修改 configuration.nix
-    if is_efi; then
-        nix_bootloader="boot.loader.efi.efiSysMountPoint = \"/efi\";"
-    else
+    if ! is_efi; then
         nix_bootloader="boot.loader.grub.device = \"/dev/$xda\";"
     fi
 
@@ -1776,8 +1774,9 @@ install_nixos() {
         nix_substituters="nix.settings.substituters = lib.mkForce [ \"$mirror/store\" ];"
     fi
 
-    if [ -e "/os$nixos_swapfile" ] && $keep_swap; then
-        nix_swap="swapDevices = [{ device = \"$nixos_swapfile\"; size = $nixos_swap_size; }];"
+    if [ -e "/os$nixos_swapfile" ] && $keep_swap &&
+        ! grep -RqsF "$nixos_swapfile" /os/etc/nixos; then
+        nix_swap="swapDevices = [{ device = \"$nixos_swapfile\"; }];"
     fi
 
     if is_need_set_ssh_keys; then
@@ -2770,17 +2769,29 @@ create_part() {
             mkfs.ext4 -F -L installer "/dev/$(xda 2)" #2 installer
         fi
     elif [ "$distro" = nixos ]; then
-        apk add btrfs-progs
+        apk add btrfs-progs dosfstools
 
-        parted /dev/$xda -s -- \
-            mklabel gpt \
-            mkpart disk-main-boot ext4 1MiB 2MiB \
-            mkpart disk-main-nixos btrfs 2MiB 100% \
-            set 1 bios_grub on
+        if is_efi; then
+            parted /dev/$xda -s -- \
+                mklabel gpt \
+                mkpart disk-main-esp fat32 1MiB 513MiB \
+                set 1 esp on \
+                mkpart disk-main-nixos btrfs 513MiB 100%
+        else
+            parted /dev/$xda -s -- \
+                mklabel gpt \
+                mkpart disk-main-boot ext4 1MiB 2MiB \
+                mkpart disk-main-nixos btrfs 2MiB 100% \
+                set 1 bios_grub on
+        fi
         update_part
 
-        echo                                #1 bios_boot
-        mkfs.btrfs -f -L nixos "/dev/$(xda 2)" #2 nixos
+        if is_efi; then
+            mkfs.fat -F 32 -n efi "/dev/$(xda 1)" #1 esp
+        else
+            echo #1 bios_boot
+        fi
+        mkfs.btrfs -f -L NIXOS "/dev/$(xda 2)" #2 nixos
         create_nixos_btrfs_subvolumes
     elif [ "$distro" = alpine ] || [ "$distro" = arch ] || [ "$distro" = gentoo ] ||
         [ "$distro" = aosc ]; then
@@ -5561,7 +5572,12 @@ create_nixos_btrfs_subvolumes() {
 
     mkdir -p $mnt
     mount -t btrfs "/dev/$(xda 2)" $mnt
-    for subvol in @root @boot @nix @swap @persist; do
+    if is_efi; then
+        subvols='@root @nix @persist @swap'
+    else
+        subvols='@root @boot @nix @swap @persist'
+    fi
+    for subvol in $subvols; do
         btrfs subvolume create "$mnt/$subvol"
     done
     umount $mnt
@@ -5576,10 +5592,17 @@ mount_nixos_btrfs_layout() {
     mount_opts=$(nixos_btrfs_mount_opts)
 
     mkdir -p $os_dir
-    mount -t btrfs -o "subvol=@root,$mount_opts" "$part" $os_dir
+    if is_efi; then
+        mount -t btrfs -o "subvol=@root,$mount_opts" "$part" $os_dir
+        mkdir -p $os_dir/boot
+        mount -t vfat -o fmask=0077,dmask=0077 "/dev/$(xda 1)" $os_dir/boot
+    else
+        mount -t btrfs -o "subvol=@root,$mount_opts" "$part" $os_dir
+        mkdir -p $os_dir/boot
+        mount -t btrfs -o "subvol=@boot,$mount_opts" "$part" $os_dir/boot
+    fi
 
-    mkdir -p $os_dir/boot $os_dir/nix $os_dir/.swap $os_dir/persist $os_dir/.subvols
-    mount -t btrfs -o "subvol=@boot,$mount_opts" "$part" $os_dir/boot
+    mkdir -p $os_dir/nix $os_dir/.swap $os_dir/persist $os_dir/.subvols
     mount -t btrfs -o "subvol=@nix,$mount_opts" "$part" $os_dir/nix
     mount -t btrfs -o "subvol=@swap" "$part" $os_dir/.swap
     mount -t btrfs -o "subvol=@persist,$mount_opts" "$part" $os_dir/persist
