@@ -1413,7 +1413,7 @@ Continue?
         if is_in_china; then
             mirror=https://mirror.nju.edu.cn/nix-channels
         else
-            mirror=https://nixos.org/channels
+            mirror=https://channels.nixos.org
         fi
 
         if is_use_cloud_image; then
